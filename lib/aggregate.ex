@@ -416,12 +416,6 @@ defmodule AshSql.Aggregate do
     end)
   end
 
-  # Check if all aggregates have multitenancy: :bypass
-  defp has_bypass_multitenancy?(aggregates) do
-    Enum.all?(aggregates, fn agg ->
-      Map.get(agg, :multitenancy) == :bypass
-    end)
-  end
 
   defp get_subquery(
          _resource,
@@ -502,24 +496,13 @@ defmodule AshSql.Aggregate do
             {:error, error}
 
           {:ok, filtered} ->
-            # For bypass aggregates with context multitenancy, don't set schema prefix
-            # This allows querying across all tenant schemas
+            # Set tenant prefix for aggregates
             filtered =
-              if has_bypass_multitenancy?(aggregates) do
-                # Don't set tenant prefix for bypass aggregates
-                AshSql.Join.set_join_prefix(
-                  filtered,
-                  query,
-                  aggregate_resource
-                )
-              else
-                # Set tenant prefix for normal aggregates
-                AshSql.Join.set_join_prefix(
-                  filtered,
-                  %{query | prefix: tenant},
-                  aggregate_resource
-                )
-              end
+              AshSql.Join.set_join_prefix(
+                filtered,
+                %{query | prefix: tenant},
+                aggregate_resource
+              )
 
             {:ok,
              select_all_aggregates(
@@ -615,19 +598,11 @@ defmodule AshSql.Aggregate do
                       )
                 )
 
-              if has_bypass_multitenancy?(aggregates) do
-                AshSql.Join.set_join_prefix(
-                  subquery,
-                  query,
-                  first_relationship.destination
-                )
-              else
-                AshSql.Join.set_join_prefix(
-                  subquery,
-                  %{query | prefix: tenant},
-                  first_relationship.destination
-                )
-              end
+              AshSql.Join.set_join_prefix(
+                subquery,
+                %{query | prefix: tenant},
+                first_relationship.destination
+              )
             else
               field = first_relationship.destination_attribute
 
@@ -654,19 +629,11 @@ defmodule AshSql.Aggregate do
                     ]
                   )
 
-                if has_bypass_multitenancy?(aggregates) do
-                  AshSql.Join.set_join_prefix(
-                    subquery,
-                    query,
-                    first_relationship.destination
-                  )
-                else
-                  AshSql.Join.set_join_prefix(
-                    subquery,
-                    %{query | prefix: tenant},
-                    first_relationship.destination
-                  )
-                end
+                AshSql.Join.set_join_prefix(
+                  subquery,
+                  %{query | prefix: tenant},
+                  first_relationship.destination
+                )
               else
                 from(row in subquery,
                   group_by: field(row, ^field),
@@ -686,19 +653,11 @@ defmodule AshSql.Aggregate do
           end
 
         subquery =
-          if has_bypass_multitenancy?(aggregates) do
-            AshSql.Join.set_join_prefix(
-              subquery,
-              query,
-              first_relationship.destination
-            )
-          else
-            AshSql.Join.set_join_prefix(
-              subquery,
-              %{query | prefix: tenant},
-              first_relationship.destination
-            )
-          end
+          AshSql.Join.set_join_prefix(
+            subquery,
+            %{query | prefix: tenant},
+            first_relationship.destination
+          )
 
         {:ok, subquery, _} =
           apply_first_relationship_join_filters(
