@@ -10,12 +10,6 @@ defmodule AshSql.AggregateQuery do
     original_query =
       AshSql.Bindings.default_bindings(original_query, resource, implementation)
 
-    # All aggregates are processed the same way in ash_sql
-    # Bypass handling is done at the ash_postgres layer
-    run_normal_aggregate_query(original_query, aggregates, resource, implementation)
-  end
-
-  defp run_normal_aggregate_query(original_query, aggregates, resource, implementation) do
     {can_group, cant_group} =
       aggregates
       |> Enum.split_with(&AshSql.Aggregate.can_group?(resource, &1, original_query))
