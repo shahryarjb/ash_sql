@@ -10,28 +10,22 @@ defmodule AshSql.AggregateQuery do
     original_query =
       AshSql.Bindings.default_bindings(original_query, resource, implementation)
 
-    # Check if any aggregate has bypass multitenancy with context strategy
-    bypass_context_multitenancy? =
-      Enum.any?(aggregates, fn agg ->
-        # Check direct multitenancy field
-        has_bypass = Map.get(agg, :multitenancy) == :bypass
-
-        is_context =
-          case agg.relationship_path do
-            [] ->
-              Ash.Resource.Info.multitenancy_strategy(resource) == :context
-            path ->
-              related = Ash.Resource.Info.related(resource, path)
-              Ash.Resource.Info.multitenancy_strategy(related) == :context
-          end
-
-        has_bypass && is_context
+    # Check if we have bypass aggregates with context multitenancy
+    bypass_aggregates =
+      Enum.filter(aggregates, fn agg ->
+        Map.get(agg, :multitenancy) == :bypass &&
+          Ash.Resource.Info.multitenancy_strategy(resource) == :context
       end)
 
-    if bypass_context_multitenancy? do
-      run_bypass_context_aggregate_query(original_query, aggregates, resource, implementation)
-    else
-      run_normal_aggregate_query(original_query, aggregates, resource, implementation)
+    case bypass_aggregates do
+      [] ->
+        # No bypass aggregates, use normal path
+        run_normal_aggregate_query(original_query, aggregates, resource, implementation)
+
+      _ ->
+        # Have bypass aggregates with context multitenancy
+        # Query across all tenants and combine results
+        run_bypass_aggregate_query(original_query, aggregates, resource, implementation)
     end
   end
 
@@ -112,262 +106,44 @@ defmodule AshSql.AggregateQuery do
     end
   end
 
-  # Special handling for bypass aggregates with context multitenancy
-  defp run_bypass_context_aggregate_query(original_query, aggregates, resource, implementation) do
-    repo = AshSql.dynamic_repo(resource, implementation, original_query)
-
-    # Get all tenants
-    all_tenants =
-      if function_exported?(repo, :all_tenants, 0) do
-        repo.all_tenants()
-      else
-        []
-      end
-
-    # If no tenants, return default values
-    if all_tenants == [] do
-      {:ok, build_default_aggregate_results(aggregates)}
-    else
-      # Build results for each aggregate
-      result =
-        Enum.reduce(aggregates, %{}, fn agg, acc ->
-          value =
-            if Map.get(agg, :multitenancy) == :bypass do
-              # Query across all tenants for bypass aggregates
-              query_all_tenants_aggregate(agg, resource, all_tenants, repo, implementation)
-            else
-              # Query single tenant for normal aggregates
-              query_single_tenant_aggregate(agg, resource, original_query, repo, implementation)
-            end
-
-          Map.put(acc, agg.name, value)
-        end)
-
-      {:ok, result}
-    end
-  end
-
-  defp build_default_aggregate_results(aggregates) do
-    Enum.reduce(aggregates, %{}, fn agg, acc ->
-      default_value =
-        case agg.kind do
-          :count -> 0
-          :exists -> false
-          :list -> []
-          _ -> nil
-        end
-
-      Map.put(acc, agg.name, default_value)
-    end)
-  end
-
-  defp query_all_tenants_aggregate(agg, resource, all_tenants, repo, implementation) do
-    # Get the relationship path
-    related_resource =
-      case agg.relationship_path do
-        [] -> resource
-        path -> Ash.Resource.Info.related(resource, path)
-      end
-
-    table_name = implementation.table(related_resource)
-
-    # Build UNION ALL query across all tenants
-    union_query =
-      all_tenants
-      |> Enum.map(fn tenant ->
-        case agg.kind do
-          :count ->
-            "SELECT COUNT(*) as value FROM \"#{tenant}\".\"#{table_name}\""
-
-          :exists ->
-            "SELECT EXISTS(SELECT 1 FROM \"#{tenant}\".\"#{table_name}\" LIMIT 1) as value"
-
-          :list ->
-            field = to_string(agg.field || :id)
-            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\""
-
-          :sum ->
-            field = to_string(agg.field)
-            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" WHERE \"#{field}\" IS NOT NULL"
-
-          :max ->
-            field = to_string(agg.field)
-            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" WHERE \"#{field}\" IS NOT NULL"
-
-          :min ->
-            field = to_string(agg.field)
-            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" WHERE \"#{field}\" IS NOT NULL"
-
-          :avg ->
-            field = to_string(agg.field)
-            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" WHERE \"#{field}\" IS NOT NULL"
-
-          :first ->
-            field = to_string(agg.field || :id)
-            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" LIMIT 1"
-
-          _ ->
-            "SELECT COUNT(*) as value FROM \"#{tenant}\".\"#{table_name}\""
-        end
-      end)
-      |> Enum.join(" UNION ALL ")
-
-    # Wrap union query with aggregation
-    final_query =
-      case agg.kind do
-        :count ->
-          "SELECT COALESCE(SUM(value), 0) FROM (#{union_query}) as combined"
-
-        :exists ->
-          "SELECT BOOL_OR(value) FROM (#{union_query}) as combined"
-
-        :list ->
-          "SELECT ARRAY_AGG(DISTINCT value) FROM (#{union_query}) as combined WHERE value IS NOT NULL"
-
-        :sum ->
-          "SELECT SUM(value) FROM (#{union_query}) as combined"
-
-        :max ->
-          "SELECT MAX(value) FROM (#{union_query}) as combined"
-
-        :min ->
-          "SELECT MIN(value) FROM (#{union_query}) as combined"
-
-        :avg ->
-          "SELECT AVG(value) FROM (#{union_query}) as combined"
-
-        :first ->
-          "SELECT value FROM (#{union_query} LIMIT 1) as combined"
-
-        _ ->
-          "SELECT COALESCE(SUM(value), 0) FROM (#{union_query}) as combined"
-      end
-
-    result = repo.query!(final_query)
-
-    case result.rows do
-      [[nil]] ->
-        # Return appropriate default for nil results
-        case agg.kind do
-          :count -> 0
-          :exists -> false
-          :list -> []
-          _ -> nil
-        end
-      [[value]] ->
-        # Convert Decimal to integer for count aggregates
-        case agg.kind do
-          :count ->
-            if is_struct(value, Decimal) do
-              Decimal.to_integer(value)
-            else
-              value
-            end
-          _ ->
-            value
-        end
-      _ ->
-        case agg.kind do
-          :count -> 0
-          :exists -> false
-          :list -> []
-          _ -> nil
-        end
-    end
-  end
-
-  defp query_single_tenant_aggregate(agg, resource, original_query, _repo, implementation) do
-    # Use the existing single aggregate logic for non-bypass aggregates
-    {:ok, result} =
-      run_normal_aggregate_query(original_query, [agg], resource, implementation)
-
-    Map.get(result, agg.name)
-  end
-
   def add_single_aggs(result, resource, query, cant_group, implementation) do
     Enum.reduce(cant_group, result, fn
       %{kind: :exists} = agg, result ->
-        # Check for bypass aggregates with context multitenancy
-        if Map.get(agg, :multitenancy) == :bypass &&
-           Ash.Resource.Info.multitenancy_strategy(resource) == :context do
-          # For bypass EXISTS aggregates, query all tenants
-          repo = AshSql.dynamic_repo(resource, implementation, query)
+        # Note: Bypass EXISTS aggregates are handled at the query execution level
+        # This just handles normal EXISTS aggregates
+        {:ok, filtered} =
+          case agg do
+            %{query: %{filter: filter}} when not is_nil(filter) ->
+              AshSql.Filter.filter(query, filter, resource)
 
-          # Get all tenants
-          all_tenants =
-            if function_exported?(repo, :all_tenants, 0) do
-              repo.all_tenants()
-            else
-              []
-            end
+            _ ->
+              {:ok, query}
+          end
 
-          # Get the relationship path
-          related_resource =
-            case agg.relationship_path do
-              [] -> resource
-              path -> Ash.Resource.Info.related(resource, path)
-            end
-
-          table_name = implementation.table(related_resource)
-
-          # Build UNION ALL query to check EXISTS across all tenants
-          exists_result =
-            if all_tenants == [] do
-              false
-            else
-              union_query =
-                all_tenants
-                |> Enum.map(fn tenant ->
-                  "SELECT 1 FROM \"#{tenant}\".\"#{table_name}\" LIMIT 1"
-                end)
-                |> Enum.join(" UNION ALL ")
-
-              final_query = "SELECT EXISTS(#{union_query})"
-              result = repo.query!(final_query)
-
-              case result.rows do
-                [[true]] -> true
-                _ -> false
-              end
-            end
-
-          Map.put(result || %{}, agg.name, exists_result)
-        else
-          # Normal EXISTS aggregate processing
-          {:ok, filtered} =
-            case agg do
-              %{query: %{filter: filter}} when not is_nil(filter) ->
-                AshSql.Filter.filter(query, filter, resource)
-
-              _ ->
-                {:ok, query}
-            end
-
-          filtered =
-            if filtered.distinct || filtered.limit do
-              filtered =
-                filtered
-                |> Ecto.Query.exclude(:select)
-                |> Ecto.Query.exclude(:order_by)
-                |> Map.put(:windows, [])
-
-              from(row in subquery(filtered), as: ^query.__ash_bindings__.root_binding, select: %{})
-            else
+        filtered =
+          if filtered.distinct || filtered.limit do
+            filtered =
               filtered
               |> Ecto.Query.exclude(:select)
               |> Ecto.Query.exclude(:order_by)
               |> Map.put(:windows, [])
-              |> Ecto.Query.select(%{})
-            end
 
-          repo = AshSql.dynamic_repo(resource, implementation, filtered)
+            from(row in subquery(filtered), as: ^query.__ash_bindings__.root_binding, select: %{})
+          else
+            filtered
+            |> Ecto.Query.exclude(:select)
+            |> Ecto.Query.exclude(:order_by)
+            |> Map.put(:windows, [])
+            |> Ecto.Query.select(%{})
+          end
 
-          Map.put(
-            result || %{},
-            agg.name,
-            repo.exists?(filtered, AshSql.repo_opts(repo, implementation, nil, nil, resource))
-          )
-        end
+        repo = AshSql.dynamic_repo(resource, implementation, filtered)
+
+        Map.put(
+          result || %{},
+          agg.name,
+          repo.exists?(filtered, AshSql.repo_opts(repo, implementation, nil, nil, resource))
+        )
 
       agg, result ->
         {:ok, filtered} =
@@ -500,5 +276,69 @@ defmodule AshSql.AggregateQuery do
           )
         )
     end)
+  end
+
+  defp run_bypass_aggregate_query(original_query, aggregates, resource, implementation) do
+    repo = AshSql.dynamic_repo(resource, implementation, original_query)
+
+    # Get all tenants to query across
+    all_tenants =
+      if repo && function_exported?(repo, :all_tenants, 0) do
+        repo.all_tenants()
+      else
+        []
+      end
+
+    # Query each tenant
+    tenant_results =
+      Enum.map(all_tenants, fn tenant ->
+        # Set tenant prefix on query
+        tenant_query = Ecto.Query.put_query_prefix(original_query, tenant)
+
+        # Run normal aggregate query for this tenant
+        case run_normal_aggregate_query(tenant_query, aggregates, resource, implementation) do
+          {:ok, result} -> result
+          {:error, _} -> %{}
+        end
+      end)
+
+    # Combine results based on aggregate kind
+    combined_result =
+      Enum.reduce(aggregates, %{}, fn agg, acc ->
+        combined_value =
+          case agg.kind do
+            :count ->
+              # Sum all counts across tenants
+              Enum.reduce(tenant_results, 0, fn result, sum ->
+                sum + (Map.get(result, agg.name) || 0)
+              end)
+
+            :exists ->
+              # Any tenant has a match?
+              Enum.any?(tenant_results, fn result ->
+                Map.get(result, agg.name) == true
+              end)
+
+            :list ->
+              # Combine all lists
+              Enum.flat_map(tenant_results, fn result ->
+                Map.get(result, agg.name) || []
+              end)
+
+            :sum ->
+              # Sum all sums
+              Enum.reduce(tenant_results, 0, fn result, sum ->
+                sum + (Map.get(result, agg.name) || 0)
+              end)
+
+            _ ->
+              # For other aggregate types, return nil
+              nil
+          end
+
+        Map.put(acc, agg.name, combined_value)
+      end)
+
+    {:ok, combined_result}
   end
 end

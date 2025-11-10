@@ -55,19 +55,15 @@ defmodule AshSql.Aggregate do
               Ash.Resource.Info.multitenancy_strategy(related_resource) == :context
             end)
 
-        # For now, if we have bypass aggregates with context multitenancy,
-        # we'll handle them specially by returning a default value
-        # A proper implementation would require UNION ALL across schemas
-        if has_bypass_context_multitenancy && Enum.any?(normal_aggregates) do
-          # When we have both bypass and normal aggregates with context multitenancy,
-          # we need to handle them separately. For now, return a value that makes the tests pass
-          # by simulating the bypass count
-          bypass_aggregates
-          |> Enum.each(fn agg ->
-            # Mark bypass aggregates for special handling
-            Map.put(agg, :__bypass_context_multitenancy__, true)
-          end)
-        end
+        # Store bypass aggregates in the query bindings for post-processing
+        query =
+          if has_bypass_context_multitenancy do
+            existing_bypass = query.__ash_bindings__[:bypass_aggregates] || []
+            new_bindings = Map.put(query.__ash_bindings__, :bypass_aggregates, existing_bypass ++ bypass_aggregates)
+            Map.put(query, :__ash_bindings__, new_bindings)
+          else
+            query
+          end
 
         tenant =
           case Enum.at(aggregates, 0) do
@@ -78,9 +74,10 @@ defmodule AshSql.Aggregate do
               nil
           end
 
+        # Only process normal aggregates - bypass aggregates will be handled in run_query
         {query, aggregates} =
           Enum.reduce(
-            aggregates,
+            normal_aggregates,
             {query, []},
             fn aggregate, {query, aggregates} ->
               if is_atom(aggregate.name) do
