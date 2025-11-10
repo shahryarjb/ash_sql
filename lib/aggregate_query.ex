@@ -95,8 +95,6 @@ defmodule AshSql.AggregateQuery do
   def add_single_aggs(result, resource, query, cant_group, implementation) do
     Enum.reduce(cant_group, result, fn
       %{kind: :exists} = agg, result ->
-        # Note: Bypass EXISTS aggregates are handled at the query execution level
-        # This just handles normal EXISTS aggregates
         {:ok, filtered} =
           case agg do
             %{query: %{filter: filter}} when not is_nil(filter) ->
@@ -263,5 +261,4 @@ defmodule AshSql.AggregateQuery do
         )
     end)
   end
-
 end
