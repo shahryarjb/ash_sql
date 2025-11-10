@@ -10,13 +10,6 @@ defmodule AshSql.AggregateQuery do
     original_query =
       AshSql.Bindings.default_bindings(original_query, resource, implementation)
 
-    # Debug: Check aggregate structure
-    Enum.each(aggregates, fn agg ->
-      IO.puts("DEBUG: Aggregate name: #{agg.name}")
-      IO.puts("DEBUG: Aggregate multitenancy field: #{inspect(Map.get(agg, :multitenancy))}")
-      IO.puts("DEBUG: Aggregate context: #{inspect(agg.context[:shared])}")
-    end)
-
     # Check if any aggregate has bypass multitenancy with context strategy
     bypass_context_multitenancy? =
       Enum.any?(aggregates, fn agg ->
@@ -34,15 +27,12 @@ defmodule AshSql.AggregateQuery do
               Ash.Resource.Info.multitenancy_strategy(related) == :context
           end
 
-        IO.puts("DEBUG: Aggregate #{agg.name} - has_bypass: #{has_bypass}, is_context: #{is_context}")
         has_bypass && is_context
       end)
 
     if bypass_context_multitenancy? do
-      IO.puts("DEBUG: Running bypass context aggregate query")
       run_bypass_context_aggregate_query(original_query, aggregates, resource, implementation)
     else
-      IO.puts("DEBUG: Running normal aggregate query")
       run_normal_aggregate_query(original_query, aggregates, resource, implementation)
     end
   end
@@ -266,7 +256,18 @@ defmodule AshSql.AggregateQuery do
           :list -> []
           _ -> nil
         end
-      [[value]] -> value
+      [[value]] ->
+        # Convert Decimal to integer for count aggregates
+        case agg.kind do
+          :count ->
+            if is_struct(value, Decimal) do
+              Decimal.to_integer(value)
+            else
+              value
+            end
+          _ ->
+            value
+        end
       _ ->
         case agg.kind do
           :count -> 0
@@ -277,7 +278,7 @@ defmodule AshSql.AggregateQuery do
     end
   end
 
-  defp query_single_tenant_aggregate(agg, resource, original_query, repo, implementation) do
+  defp query_single_tenant_aggregate(agg, resource, original_query, _repo, implementation) do
     # Use the existing single aggregate logic for non-bypass aggregates
     {:ok, result} =
       run_normal_aggregate_query(original_query, [agg], resource, implementation)
@@ -288,39 +289,87 @@ defmodule AshSql.AggregateQuery do
   def add_single_aggs(result, resource, query, cant_group, implementation) do
     Enum.reduce(cant_group, result, fn
       %{kind: :exists} = agg, result ->
-        {:ok, filtered} =
-          case agg do
-            %{query: %{filter: filter}} when not is_nil(filter) ->
-              AshSql.Filter.filter(query, filter, resource)
+        # Check for bypass aggregates with context multitenancy
+        if Map.get(agg, :multitenancy) == :bypass &&
+           Ash.Resource.Info.multitenancy_strategy(resource) == :context do
+          # For bypass EXISTS aggregates, query all tenants
+          repo = AshSql.dynamic_repo(resource, implementation, query)
 
-            _ ->
-              {:ok, query}
-          end
+          # Get all tenants
+          all_tenants =
+            if function_exported?(repo, :all_tenants, 0) do
+              repo.all_tenants()
+            else
+              []
+            end
 
-        filtered =
-          if filtered.distinct || filtered.limit do
-            filtered =
+          # Get the relationship path
+          related_resource =
+            case agg.relationship_path do
+              [] -> resource
+              path -> Ash.Resource.Info.related(resource, path)
+            end
+
+          table_name = implementation.table(related_resource)
+
+          # Build UNION ALL query to check EXISTS across all tenants
+          exists_result =
+            if all_tenants == [] do
+              false
+            else
+              union_query =
+                all_tenants
+                |> Enum.map(fn tenant ->
+                  "SELECT 1 FROM \"#{tenant}\".\"#{table_name}\" LIMIT 1"
+                end)
+                |> Enum.join(" UNION ALL ")
+
+              final_query = "SELECT EXISTS(#{union_query})"
+              result = repo.query!(final_query)
+
+              case result.rows do
+                [[true]] -> true
+                _ -> false
+              end
+            end
+
+          Map.put(result || %{}, agg.name, exists_result)
+        else
+          # Normal EXISTS aggregate processing
+          {:ok, filtered} =
+            case agg do
+              %{query: %{filter: filter}} when not is_nil(filter) ->
+                AshSql.Filter.filter(query, filter, resource)
+
+              _ ->
+                {:ok, query}
+            end
+
+          filtered =
+            if filtered.distinct || filtered.limit do
+              filtered =
+                filtered
+                |> Ecto.Query.exclude(:select)
+                |> Ecto.Query.exclude(:order_by)
+                |> Map.put(:windows, [])
+
+              from(row in subquery(filtered), as: ^query.__ash_bindings__.root_binding, select: %{})
+            else
               filtered
               |> Ecto.Query.exclude(:select)
               |> Ecto.Query.exclude(:order_by)
               |> Map.put(:windows, [])
+              |> Ecto.Query.select(%{})
+            end
 
-            from(row in subquery(filtered), as: ^query.__ash_bindings__.root_binding, select: %{})
-          else
-            filtered
-            |> Ecto.Query.exclude(:select)
-            |> Ecto.Query.exclude(:order_by)
-            |> Map.put(:windows, [])
-            |> Ecto.Query.select(%{})
-          end
+          repo = AshSql.dynamic_repo(resource, implementation, filtered)
 
-        repo = AshSql.dynamic_repo(resource, implementation, filtered)
-
-        Map.put(
-          result || %{},
-          agg.name,
-          repo.exists?(filtered, AshSql.repo_opts(repo, implementation, nil, nil, resource))
-        )
+          Map.put(
+            result || %{},
+            agg.name,
+            repo.exists?(filtered, AshSql.repo_opts(repo, implementation, nil, nil, resource))
+          )
+        end
 
       agg, result ->
         {:ok, filtered} =

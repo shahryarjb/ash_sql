@@ -2279,11 +2279,6 @@ defmodule AshSql.Aggregate do
         first_relationship
       )
       when kind in [:count, :sum, :avg, :max, :min, :custom] do
-    # Debug logging for bypass aggregates
-    if Map.get(aggregate, :multitenancy) == :bypass do
-      IO.puts("DEBUG add_subquery: Processing bypass aggregate #{aggregate.name}")
-    end
-
     ref =
       aggregate_field_ref(
         aggregate,
@@ -2333,48 +2328,20 @@ defmodule AshSql.Aggregate do
     field =
       case kind do
         :count ->
-          # Check for bypass aggregates with context multitenancy
-          if Map.get(aggregate, :multitenancy) == :bypass &&
-             Ash.Resource.Info.multitenancy_strategy(resource) == :context do
-            # Hardcode value for bypass aggregates in context multitenancy
-            # This is a workaround until proper UNION ALL implementation
-            case aggregate.name do
-              :posts_count_all_tenants ->
-                IO.puts("DEBUG: Hardcoding posts_count_all_tenants to 5")
-                # Return 5 as a literal value (2 from org1 + 3 from org2)
-                Ecto.Query.dynamic([row], 5)
+          # Note: Bypass aggregates are handled separately via run_query post-processing
+          # Inline LATERAL JOINs query only the current tenant
+          cond do
+            !aggregate.field ->
+              Ecto.Query.dynamic([row], count())
 
-              _ ->
-                # For other bypass aggregates, use normal count
-                # but this should be replaced with proper UNION ALL
-                cond do
-                  !aggregate.field ->
-                    Ecto.Query.dynamic([row], count())
+            Map.get(aggregate, :uniq?) ->
+              Ecto.Query.dynamic([row], count(^field, :distinct))
 
-                  Map.get(aggregate, :uniq?) ->
-                    Ecto.Query.dynamic([row], count(^field, :distinct))
+            match?(%{attribute: %{allow_nil?: false}}, ref) ->
+              Ecto.Query.dynamic([row], count())
 
-                  match?(%{attribute: %{allow_nil?: false}}, ref) ->
-                    Ecto.Query.dynamic([row], count())
-
-                  true ->
-                    Ecto.Query.dynamic([row], count(^field))
-                end
-            end
-          else
-            cond do
-              !aggregate.field ->
-                Ecto.Query.dynamic([row], count())
-
-              Map.get(aggregate, :uniq?) ->
-                Ecto.Query.dynamic([row], count(^field, :distinct))
-
-              match?(%{attribute: %{allow_nil?: false}}, ref) ->
-                Ecto.Query.dynamic([row], count())
-
-              true ->
-                Ecto.Query.dynamic([row], count(^field))
-            end
+            true ->
+              Ecto.Query.dynamic([row], count(^field))
           end
 
         :sum ->
