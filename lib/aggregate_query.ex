@@ -13,10 +13,8 @@ defmodule AshSql.AggregateQuery do
     # Check if any aggregate has bypass multitenancy with context strategy
     bypass_context_multitenancy? =
       Enum.any?(aggregates, fn agg ->
-        # Check both direct multitenancy field and context
-        has_bypass =
-          Map.get(agg, :multitenancy) == :bypass ||
-          agg.context[:shared][:multitenancy] == :bypass_all
+        # Check direct multitenancy field
+        has_bypass = Map.get(agg, :multitenancy) == :bypass
 
         is_context =
           case agg.relationship_path do

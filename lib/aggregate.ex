@@ -39,8 +39,7 @@ defmodule AshSql.Aggregate do
         # Separate bypass and non-bypass aggregates
         {bypass_aggregates, normal_aggregates} =
           Enum.split_with(aggregates, fn agg ->
-            Map.get(agg, :multitenancy) == :bypass ||
-            agg.context[:shared][:multitenancy] == :bypass_all
+            Map.get(agg, :multitenancy) == :bypass
           end)
 
         # Check if we have bypass aggregates with context multitenancy
