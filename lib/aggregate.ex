@@ -416,7 +416,6 @@ defmodule AshSql.Aggregate do
     end)
   end
 
-
   defp get_subquery(
          _resource,
          aggregates,
