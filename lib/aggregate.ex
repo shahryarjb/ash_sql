@@ -496,7 +496,6 @@ defmodule AshSql.Aggregate do
             {:error, error}
 
           {:ok, filtered} ->
-            # Set tenant prefix for aggregates
             filtered =
               AshSql.Join.set_join_prefix(
                 filtered,
@@ -2283,8 +2282,6 @@ defmodule AshSql.Aggregate do
     field =
       case kind do
         :count ->
-          # Note: Bypass aggregates are handled separately via run_query post-processing
-          # Inline LATERAL JOINs query only the current tenant
           cond do
             !aggregate.field ->
               Ecto.Query.dynamic([row], count())
