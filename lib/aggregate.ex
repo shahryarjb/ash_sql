@@ -36,35 +36,6 @@ defmodule AshSql.Aggregate do
               []
           end
 
-        # Separate bypass and non-bypass aggregates
-        {bypass_aggregates, normal_aggregates} =
-          Enum.split_with(aggregates, fn agg ->
-            Map.get(agg, :multitenancy) == :bypass
-          end)
-
-        # Check if we have bypass aggregates with context multitenancy
-        has_bypass_context_multitenancy =
-          Enum.any?(bypass_aggregates) &&
-            Enum.any?(bypass_aggregates, fn agg ->
-              related_resource =
-                case agg.relationship_path do
-                  [] -> resource
-                  path -> Ash.Resource.Info.related(resource, path)
-                end
-
-              Ash.Resource.Info.multitenancy_strategy(related_resource) == :context
-            end)
-
-        # Store bypass aggregates in the query bindings for post-processing
-        query =
-          if has_bypass_context_multitenancy do
-            existing_bypass = query.__ash_bindings__[:bypass_aggregates] || []
-            new_bindings = Map.put(query.__ash_bindings__, :bypass_aggregates, existing_bypass ++ bypass_aggregates)
-            Map.put(query, :__ash_bindings__, new_bindings)
-          else
-            query
-          end
-
         tenant =
           case Enum.at(aggregates, 0) do
             %{context: %{tenant: tenant}} ->
@@ -74,10 +45,9 @@ defmodule AshSql.Aggregate do
               nil
           end
 
-        # Only process normal aggregates - bypass aggregates will be handled in run_query
         {query, aggregates} =
           Enum.reduce(
-            normal_aggregates,
+            aggregates,
             {query, []},
             fn aggregate, {query, aggregates} ->
               if is_atom(aggregate.name) do
