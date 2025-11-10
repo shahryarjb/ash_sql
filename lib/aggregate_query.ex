@@ -289,56 +289,111 @@ defmodule AshSql.AggregateQuery do
         []
       end
 
-    # Query each tenant
-    tenant_results =
-      Enum.map(all_tenants, fn tenant ->
-        # Set tenant prefix on query
-        tenant_query = Ecto.Query.put_query_prefix(original_query, tenant)
+    # For bypass aggregates with context multitenancy, we need to let the database
+    # aggregate across all tenant schemas. We'll build SQL fragments that use UNION ALL
+    # to combine data from all schemas, then apply aggregates on top.
 
-        # Run normal aggregate query for this tenant
-        case run_normal_aggregate_query(tenant_query, aggregates, resource, implementation) do
-          {:ok, result} -> result
-          {:error, _} -> %{}
-        end
-      end)
-
-    # Combine results based on aggregate kind
-    combined_result =
+    result =
       Enum.reduce(aggregates, %{}, fn agg, acc ->
-        combined_value =
-          case agg.kind do
-            :count ->
-              # Sum all counts across tenants
-              Enum.reduce(tenant_results, 0, fn result, sum ->
-                sum + (Map.get(result, agg.name) || 0)
-              end)
-
-            :exists ->
-              # Any tenant has a match?
-              Enum.any?(tenant_results, fn result ->
-                Map.get(result, agg.name) == true
-              end)
-
-            :list ->
-              # Combine all lists
-              Enum.flat_map(tenant_results, fn result ->
-                Map.get(result, agg.name) || []
-              end)
-
-            :sum ->
-              # Sum all sums
-              Enum.reduce(tenant_results, 0, fn result, sum ->
-                sum + (Map.get(result, agg.name) || 0)
-              end)
-
-            _ ->
-              # For other aggregate types, return nil
-              nil
+        # Get the related resource that the aggregate operates on
+        related_resource =
+          case agg.relationship_path do
+            [] -> resource
+            path -> Ash.Resource.Info.related(resource, path)
           end
 
-        Map.put(acc, agg.name, combined_value)
+        # Build the aggregate query across all tenant schemas using SQL
+        value = compute_bypass_aggregate(agg, related_resource, all_tenants, repo, implementation)
+        Map.put(acc, agg.name, value)
       end)
 
-    {:ok, combined_result}
+    {:ok, result}
+  end
+
+  defp compute_bypass_aggregate(agg, related_resource, all_tenants, repo, implementation) do
+    # Get the table name from the resource's data layer info
+    # For AshPostgres.SqlImplementation, the Info module is AshPostgres.DataLayer.Info
+    # Take only the first part (e.g., "AshPostgres") and append "DataLayer.Info"
+    table =
+      implementation
+      |> Module.split()
+      |> Enum.take(1)
+      |> Kernel.++(["DataLayer", "Info"])
+      |> Module.concat()
+      |> apply(:table, [related_resource])
+
+    case agg.kind do
+      :count ->
+        # Build SQL: SELECT SUM(cnt) FROM (SELECT COUNT(*) as cnt FROM schema1.table UNION ALL SELECT COUNT(*) FROM schema2.table ...)
+        union_sql =
+          all_tenants
+          |> Enum.map(fn tenant ->
+            "(SELECT COUNT(*) as cnt FROM \"#{tenant}\".\"#{table}\")"
+          end)
+          |> Enum.join(" UNION ALL ")
+
+        sql = "SELECT COALESCE(SUM(cnt), 0) as total FROM (#{union_sql}) AS counts"
+
+        case repo.query(sql, [], AshSql.repo_opts(repo, implementation, nil, nil, related_resource)) do
+          {:ok, %{rows: [[count]]}} -> count
+          _ -> 0
+        end
+
+      :exists ->
+        # Build SQL: SELECT EXISTS(SELECT 1 FROM schema1.table UNION ALL SELECT 1 FROM schema2.table LIMIT 1)
+        union_sql =
+          all_tenants
+          |> Enum.map(fn tenant ->
+            "(SELECT 1 FROM \"#{tenant}\".\"#{table}\" LIMIT 1)"
+          end)
+          |> Enum.join(" UNION ALL ")
+
+        sql = "SELECT EXISTS(#{union_sql})"
+
+        case repo.query(sql, [], AshSql.repo_opts(repo, implementation, nil, nil, related_resource)) do
+          {:ok, %{rows: [[exists]]}} -> exists
+          _ -> false
+        end
+
+      :list ->
+        # Build SQL: SELECT field FROM schema1.table UNION ALL SELECT field FROM schema2.table ...
+        field = agg.field
+
+        union_sql =
+          all_tenants
+          |> Enum.map(fn tenant ->
+            "(SELECT \"#{field}\" FROM \"#{tenant}\".\"#{table}\")"
+          end)
+          |> Enum.join(" UNION ALL ")
+
+        sql = "SELECT * FROM (#{union_sql}) AS all_values"
+
+        case repo.query(sql, [], AshSql.repo_opts(repo, implementation, nil, nil, related_resource)) do
+          {:ok, %{rows: rows}} -> Enum.map(rows, fn [val] -> val end)
+          _ -> []
+        end
+
+      :sum ->
+        # Build SQL: SELECT SUM(total) FROM (SELECT SUM(field) as total FROM schema1.table UNION ALL SELECT SUM(field) FROM schema2.table ...)
+        field = agg.field
+
+        union_sql =
+          all_tenants
+          |> Enum.map(fn tenant ->
+            "(SELECT COALESCE(SUM(\"#{field}\"), 0) as total FROM \"#{tenant}\".\"#{table}\")"
+          end)
+          |> Enum.join(" UNION ALL ")
+
+        sql = "SELECT COALESCE(SUM(total), 0) as grand_total FROM (#{union_sql}) AS sums"
+
+        case repo.query(sql, [], AshSql.repo_opts(repo, implementation, nil, nil, related_resource)) do
+          {:ok, %{rows: [[sum]]}} -> sum
+          _ -> 0
+        end
+
+      _ ->
+        # For other aggregate types, return nil
+        nil
+    end
   end
 end
