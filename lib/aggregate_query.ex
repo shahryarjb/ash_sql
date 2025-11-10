@@ -10,6 +10,44 @@ defmodule AshSql.AggregateQuery do
     original_query =
       AshSql.Bindings.default_bindings(original_query, resource, implementation)
 
+    # Debug: Check aggregate structure
+    Enum.each(aggregates, fn agg ->
+      IO.puts("DEBUG: Aggregate name: #{agg.name}")
+      IO.puts("DEBUG: Aggregate multitenancy field: #{inspect(Map.get(agg, :multitenancy))}")
+      IO.puts("DEBUG: Aggregate context: #{inspect(agg.context[:shared])}")
+    end)
+
+    # Check if any aggregate has bypass multitenancy with context strategy
+    bypass_context_multitenancy? =
+      Enum.any?(aggregates, fn agg ->
+        # Check both direct multitenancy field and context
+        has_bypass =
+          Map.get(agg, :multitenancy) == :bypass ||
+          agg.context[:shared][:multitenancy] == :bypass_all
+
+        is_context =
+          case agg.relationship_path do
+            [] ->
+              Ash.Resource.Info.multitenancy_strategy(resource) == :context
+            path ->
+              related = Ash.Resource.Info.related(resource, path)
+              Ash.Resource.Info.multitenancy_strategy(related) == :context
+          end
+
+        IO.puts("DEBUG: Aggregate #{agg.name} - has_bypass: #{has_bypass}, is_context: #{is_context}")
+        has_bypass && is_context
+      end)
+
+    if bypass_context_multitenancy? do
+      IO.puts("DEBUG: Running bypass context aggregate query")
+      run_bypass_context_aggregate_query(original_query, aggregates, resource, implementation)
+    else
+      IO.puts("DEBUG: Running normal aggregate query")
+      run_normal_aggregate_query(original_query, aggregates, resource, implementation)
+    end
+  end
+
+  defp run_normal_aggregate_query(original_query, aggregates, resource, implementation) do
     {can_group, cant_group} =
       aggregates
       |> Enum.split_with(&AshSql.Aggregate.can_group?(resource, &1, original_query))
@@ -84,6 +122,167 @@ defmodule AshSql.AggregateQuery do
 
         {:ok, add_single_aggs(result, resource, query, cant_group, implementation)}
     end
+  end
+
+  # Special handling for bypass aggregates with context multitenancy
+  defp run_bypass_context_aggregate_query(original_query, aggregates, resource, implementation) do
+    repo = AshSql.dynamic_repo(resource, implementation, original_query)
+
+    # Get all tenants
+    all_tenants =
+      if function_exported?(repo, :all_tenants, 0) do
+        repo.all_tenants()
+      else
+        []
+      end
+
+    # If no tenants, return default values
+    if all_tenants == [] do
+      {:ok, build_default_aggregate_results(aggregates)}
+    else
+      # Build results for each aggregate
+      result =
+        Enum.reduce(aggregates, %{}, fn agg, acc ->
+          value =
+            if Map.get(agg, :multitenancy) == :bypass do
+              # Query across all tenants for bypass aggregates
+              query_all_tenants_aggregate(agg, resource, all_tenants, repo, implementation)
+            else
+              # Query single tenant for normal aggregates
+              query_single_tenant_aggregate(agg, resource, original_query, repo, implementation)
+            end
+
+          Map.put(acc, agg.name, value)
+        end)
+
+      {:ok, result}
+    end
+  end
+
+  defp build_default_aggregate_results(aggregates) do
+    Enum.reduce(aggregates, %{}, fn agg, acc ->
+      default_value =
+        case agg.kind do
+          :count -> 0
+          :exists -> false
+          :list -> []
+          _ -> nil
+        end
+
+      Map.put(acc, agg.name, default_value)
+    end)
+  end
+
+  defp query_all_tenants_aggregate(agg, resource, all_tenants, repo, implementation) do
+    # Get the relationship path
+    related_resource =
+      case agg.relationship_path do
+        [] -> resource
+        path -> Ash.Resource.Info.related(resource, path)
+      end
+
+    table_name = implementation.table(related_resource)
+
+    # Build UNION ALL query across all tenants
+    union_query =
+      all_tenants
+      |> Enum.map(fn tenant ->
+        case agg.kind do
+          :count ->
+            "SELECT COUNT(*) as value FROM \"#{tenant}\".\"#{table_name}\""
+
+          :exists ->
+            "SELECT EXISTS(SELECT 1 FROM \"#{tenant}\".\"#{table_name}\" LIMIT 1) as value"
+
+          :list ->
+            field = to_string(agg.field || :id)
+            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\""
+
+          :sum ->
+            field = to_string(agg.field)
+            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" WHERE \"#{field}\" IS NOT NULL"
+
+          :max ->
+            field = to_string(agg.field)
+            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" WHERE \"#{field}\" IS NOT NULL"
+
+          :min ->
+            field = to_string(agg.field)
+            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" WHERE \"#{field}\" IS NOT NULL"
+
+          :avg ->
+            field = to_string(agg.field)
+            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" WHERE \"#{field}\" IS NOT NULL"
+
+          :first ->
+            field = to_string(agg.field || :id)
+            "SELECT \"#{field}\" as value FROM \"#{tenant}\".\"#{table_name}\" LIMIT 1"
+
+          _ ->
+            "SELECT COUNT(*) as value FROM \"#{tenant}\".\"#{table_name}\""
+        end
+      end)
+      |> Enum.join(" UNION ALL ")
+
+    # Wrap union query with aggregation
+    final_query =
+      case agg.kind do
+        :count ->
+          "SELECT COALESCE(SUM(value), 0) FROM (#{union_query}) as combined"
+
+        :exists ->
+          "SELECT BOOL_OR(value) FROM (#{union_query}) as combined"
+
+        :list ->
+          "SELECT ARRAY_AGG(DISTINCT value) FROM (#{union_query}) as combined WHERE value IS NOT NULL"
+
+        :sum ->
+          "SELECT SUM(value) FROM (#{union_query}) as combined"
+
+        :max ->
+          "SELECT MAX(value) FROM (#{union_query}) as combined"
+
+        :min ->
+          "SELECT MIN(value) FROM (#{union_query}) as combined"
+
+        :avg ->
+          "SELECT AVG(value) FROM (#{union_query}) as combined"
+
+        :first ->
+          "SELECT value FROM (#{union_query} LIMIT 1) as combined"
+
+        _ ->
+          "SELECT COALESCE(SUM(value), 0) FROM (#{union_query}) as combined"
+      end
+
+    result = repo.query!(final_query)
+
+    case result.rows do
+      [[nil]] ->
+        # Return appropriate default for nil results
+        case agg.kind do
+          :count -> 0
+          :exists -> false
+          :list -> []
+          _ -> nil
+        end
+      [[value]] -> value
+      _ ->
+        case agg.kind do
+          :count -> 0
+          :exists -> false
+          :list -> []
+          _ -> nil
+        end
+    end
+  end
+
+  defp query_single_tenant_aggregate(agg, resource, original_query, repo, implementation) do
+    # Use the existing single aggregate logic for non-bypass aggregates
+    {:ok, result} =
+      run_normal_aggregate_query(original_query, [agg], resource, implementation)
+
+    Map.get(result, agg.name)
   end
 
   def add_single_aggs(result, resource, query, cant_group, implementation) do
